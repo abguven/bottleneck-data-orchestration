@@ -1,0 +1,240 @@
+id: bottleneck_pipeline
+namespace: edu.oc.dataengineer
+
+variables:
+  s3_path: "raw/{{ now() | date('yyyy/MM') }}/"
+  s3_bucket: bottleneck-data-lake
+  required_files: ['erp.xlsx', 'web.xlsx', 'liaison.xlsx']
+
+tasks:
+  # --- 1. INGESTION & VÉRIFICATION INITIALE ---
+  - id: download_from_s3
+    type: io.kestra.plugin.aws.s3.Downloads
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}" 
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    region: "{{ envs.aws_default_region }}"
+    bucket: "{{ vars.s3_bucket }}"
+    prefix: "{{ render(vars.s3_path) }}"
+    action: NONE
+
+  - id: check_source_integrity
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: abguven/pandas-openpyxl
+    inputFiles: "{{ outputs.download_from_s3.outputFiles }}"
+    script: |
+      import os, sys
+      path = "{{ render(vars.s3_path) }}"
+      required_files = {{ vars.required_files }}
+          
+      for file_name in required_files:
+          full_path = os.path.join(path, file_name)
+          if not os.path.exists(full_path) or os.path.getsize(full_path) == 0:
+              sys.exit(f"ERREUR CRITIQUE : Fichier {file_name} manquant ou vide.")
+      print("✅ Intégrité des sources validée.")
+
+  # --- 2. PRÉPARATION & NETTOYAGE (DUCKDB) ---
+  - id: convert_to_csv
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: abguven/pandas-openpyxl
+    inputFiles: "{{ outputs.download_from_s3.outputFiles }}"
+    script: |
+      import pandas as pd
+      import os
+      path = "{{ render(vars.s3_path) }}"
+
+      for file_name in {{ vars.required_files }}:
+        if file_name.endswith('.xlsx'):
+          base_name = file_name.replace('.xlsx', '')
+          pd.read_excel(os.path.join(path, file_name)).to_csv(f'{base_name}_raw.csv', index=False)
+
+    outputFiles:
+      - "*.csv"
+
+  - id: process_data_sql
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    retry:
+      type: constant
+      maxAttempt: 3        
+      interval: PT10S # 10 secondes entre chaque essaie    
+    inputFiles: "{{ outputs.convert_to_csv.outputFiles }}"
+    fetch: true # Récupère les lignes du dernier SELECT pour la suite
+    sql: |
+      -- 1. Nettoyage ERP
+      CREATE TABLE erp_clean AS 
+      SELECT DISTINCT product_id, price 
+      FROM read_csv_auto('erp_raw.csv') 
+      WHERE price > 0;
+
+      -- 2. Nettoyage Web
+      CREATE TABLE web_clean AS 
+      SELECT DISTINCT sku AS id_web, total_sales, post_title 
+      FROM read_csv_auto('web_raw.csv') 
+      WHERE post_type = 'product' AND sku IS NOT NULL;
+
+      -- 3. Nettoyage Liaison
+      CREATE TABLE liaison_clean AS 
+      SELECT DISTINCT product_id, id_web 
+      FROM read_csv_auto('liaison_raw.csv') 
+      WHERE id_web IS NOT NULL;
+
+      -- 4. Jointure Finale (C'est ce SELECT qui sera envoyé aux outputs)
+      SELECT 
+        (SELECT COUNT(*) FROM web_clean) as web_clean_count,      
+        l.product_id, l.id_web, w.post_title, e.price, w.total_sales, 
+        (e.price * w.total_sales) AS product_revenue,
+        SUM(e.price * w.total_sales) OVER() AS total_turnover
+      FROM liaison_clean l
+      INNER JOIN erp_clean e ON l.product_id = e.product_id
+      INNER JOIN web_clean w ON l.id_web = w.id_web;
+
+  # --- 3. BARRIÈRES DE SÉCURITÉ (TESTS LOGIQUES) ---
+  - id: validate_metrics
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: abguven/pandas-openpyxl
+    script: |
+      import pandas as pd
+      import sys, json
+      
+      data = {{ outputs.process_data_sql.outputs[0].rows | json }}
+      df = pd.DataFrame(data)
+
+      # 1. Test d'absence de doublons
+      duplicate_count = df.duplicated(subset=['product_id']).sum()
+      if duplicate_count > 0:
+        sys.exit(f"ERREUR : {duplicate_count} doublon(s) détecté(s) sur la clé primaire product_id.")
+
+      # 2. Test d'absence de valeurs manquantes
+      missing_values = df[['product_id', 'price', 'total_sales']].isnull().any(axis=1).sum()
+      if missing_values > 0:
+          sys.exit(f"ERREUR : {missing_values} ligne(s) contiennent des valeurs manquantes ou NULL.")  
+
+      # 3. Test de cohérence des jointures 
+      expected = df['web_clean_count'].iloc[0]
+      actual = len(df)
+      if actual != expected:
+          sys.exit(f"ERREUR : Perte de données détectée ({actual}/{expected} produits).")     
+
+      # 4. Test de cohérence du chiffre d'affaires
+      sum_revenue = round(df['product_revenue'].sum(), 2)
+      global_turnover = round(df['total_turnover'].iloc[0], 2)
+      if abs(sum_revenue - global_turnover) > 0.01:
+          sys.exit(f"ERREUR : Incohérence calcul CA ({sum_revenue} vs {global_turnover}).")          
+      
+      print(f"✅ Tests validés : {actual} produits réconciliés. CA Total: {global_turnover}€")
+
+  # --- 4. ANALYSE STATISTIQUE & EXPORTS (PYTHON) ---
+  - id: calculate_zscore_and_export
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: abguven/pandas-openpyxl
+    script: |
+      import pandas as pd
+      import sys, json
+
+      data = {{ outputs.process_data_sql.outputs[0].rows | json }}
+      df = pd.DataFrame(data)
+      
+      # Calcul Z-Score
+      mean_p = df['price'].mean()
+      std_p = df['price'].std()
+      df['z_score'] = (df['price'] - mean_p) / std_p
+      df['is_premium'] = df['z_score'] > 2
+
+      # Test de vraisemblance
+      nb_premium = df['is_premium'].sum()
+      if nb_premium == 0:
+          sys.exit("ERREUR : Aucun vin premium détecté. Vérifiez les données de prix.")
+
+
+      # --- Génération du rapport final ---
+      nb_final = len(df)
+      ca_global = round(df['total_turnover'].iloc[0], 2)
+
+      # Affichage "Executive Summary"
+      print("\n" + "█"*60)
+      print(f"█  RAPPORT D'EXÉCUTION AUTOMATISÉ - {pd.Timestamp.now().strftime('%d/%m/%Y')}")
+      print("█"*60)
+      print(f"█  RÉSULTATS")
+      print(f"█     - Produit réconciliés : {nb_final}")
+      print(f"█     - Vins Premium        : {nb_premium}")
+      print(f"█     - Chiffre d'Affaires  : {ca_global:,.2f} €")
+      print("█"*60 + "\n")
+
+      kestra_outputs = {
+          "final_count": int(nb_final),
+          "premium_count": int(nb_premium),
+          "total_ca": f"{ca_global:,.2f}" 
+      }
+      final_json = json.dumps({"outputs": kestra_outputs})
+      print("::" + final_json + "::")
+
+      # Exports
+      df[df['is_premium']].to_csv('premium_wines.csv', index=False, encoding='utf-8-sig')
+      df[~df['is_premium']].to_csv('ordinary_wines.csv', index=False, encoding='utf-8-sig')
+      df.drop(columns=['web_clean_count']).to_excel('final_report_ca.xlsx', index=False)
+    outputFiles:
+      - "*.csv"
+      - "*.xlsx"
+
+  # --- 5. NOTIFICATIONS ---
+  - id: send_success_email
+    type: io.kestra.plugin.email.MailSend
+    from: "{{ secret('SMTP_USER') }}"
+    to: "{{ envs.notification_email }}"
+    # to: "abguven@gmail.com"
+    subject: "Rapports Mensuels BottleNeck - Succès"
+    host: smtp.gmail.com
+    port: 465
+    username: "{{ secret('SMTP_USER') }}"
+    password: "{{ secret('SMTP_PASS') }}"
+    transportStrategy: SMTPS
+    # ON AJOUTE LES 3 PIÈCES JOINTES ICI
+    attachments:
+      - name: rapport_ca_final.xlsx
+        uri: "{{ outputs.calculate_zscore_and_export.outputFiles['final_report_ca.xlsx'] }}"
+      - name: vins_premium.csv
+        uri: "{{ outputs.calculate_zscore_and_export.outputFiles['premium_wines.csv'] }}"
+      - name: vins_ordinaires.csv
+        uri: "{{ outputs.calculate_zscore_and_export.outputFiles['ordinary_wines.csv'] }}"
+    htmlTextContent: |
+      <h2>Bonjour Laurent,</h2>
+      <p>Le pipeline d'analyse mensuelle s'est terminé avec succès.</p>
+      
+      <h3>Synthèse des résultats :</h3>
+      <ul>
+        <li><b>Produits réconciliés :</b> {{ outputs.calculate_zscore_and_export.vars.final_count }}</li>
+        <li><b>Vins Premium détectés :</b> {{ outputs.calculate_zscore_and_export.vars.premium_count }}</li>
+        <li><b>Chiffre d'Affaires Total :</b> {{ outputs.calculate_zscore_and_export.vars.total_ca }} €</li>
+      </ul>
+      <p>Veuillez trouver ci-joint le rapport global (Excel) ainsi que les extractions par catégorie (CSV).</p>
+      
+errors:
+  - id: send_failure_email
+    type: io.kestra.plugin.email.MailSend
+    from: "{{ secret('SMTP_USER') }}"
+    to: "{{ envs.notification_email }}"
+    subject: "🚨 ÉCHEC du Pipeline BottleNeck"
+    host: smtp.gmail.com
+    port: 465
+    username: "{{ secret('SMTP_USER') }}"
+    password: "{{ secret('SMTP_PASS') }}"
+    htmlTextContent: |
+      <h3>Une erreur est survenue lors de l'exécution du pipeline.</h3>
+      <p>ID Exécution : {{ execution.id }}</p>
+      <p>Veuillez consulter les logs pour plus de détails.</p>
+
+triggers:
+  - id: schedule_monthly
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 15 * *"
+    timezone: Europe/Paris
+
+
+

@@ -1,0 +1,22 @@
+# --- SÉCURITÉ (Crucial) ---
+config.json
+.env
+aws/
+.venv/
+__pycache__/
+
+# --- WORKING DIRECTORIES
+notebooks/
+scripts/
+sandbox/
+utils/
+src/
+data/summary
+poetry.lock
+pyproject.toml
+
+# --- WHAT WE KEEP ---
+!data/
+!outputs/
+!orchestration/
+!assets/
