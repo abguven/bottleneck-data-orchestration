@@ -13,7 +13,17 @@ This project industrializes the data analysis process for **BottleNeck**, a fict
 
 The pipeline is built on a **Decoupled Architecture** (Storage vs. Compute), ensuring scalability and durability.
 
+### 🌍 1. Global Infrastructure
+
+*High-level view of the interaction between AWS S3, Kestra, DuckDB, and Docker.*
+
 ![Architecture Diagram](./assets/Architecture%20Pipeline.drawio.png)
+
+### 🔎 2. Detailed Data Flow & Quality Gates
+
+*In-depth view of the transformation logic (SQL), validation steps (Python), and "Fail-Fast" mechanisms.*
+
+![Data Flow Diagram](./assets/Data%20Flow.drawio.png)
 
 ### ⚙️ Pipeline Workflow
 
